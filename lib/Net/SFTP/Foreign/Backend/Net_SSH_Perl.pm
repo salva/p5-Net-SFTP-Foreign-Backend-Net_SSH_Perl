@@ -1,47 +1,132 @@
 package Net::SFTP::Foreign::Backend::Net_SSH_Perl;
 
-use 5.012004;
+our $VERSION = '0.01';
+
 use strict;
 use warnings;
 
-require Exporter;
+use Carp;
+our @CARP_NOT = qw(Net::SFTP::Foreign);
 
-our @ISA = qw(Exporter);
+use Net::SFTP::Foreign::Helpers;
+use Net::SFTP::Foreign::Constants qw(SSH2_FX_BAD_MESSAGE
+				     SFTP_ERR_REMOTE_BAD_MESSAGE);
 
-# Items to export into callers namespace by default. Note: do not export
-# names by default without a very good reason. Use EXPORT_OK instead.
-# Do not simply export all your public functions/methods/constants.
+sub _new {
+    my $class = shift;
 
-# This allows declaration	use Net::SFTP::Foreign::Backend::Net_SSH_Perl ':all';
-# If you do not need this, moving things directly into @EXPORT or @EXPORT_OK
-# will save memory.
-our %EXPORT_TAGS = ( 'all' => [ qw(
-	
-) ] );
+    eval {
+        require Net::SSH::Perl;
+        require Net::SSH::Perl::Constants;
+        1;
+    } or croak "Module Net::SSH::Perl required by $class can not be loaded";
 
-our @EXPORT_OK = ( @{ $EXPORT_TAGS{'all'} } );
+    my $self = {};
+    bless $self, $class;
+}
 
-our @EXPORT = qw(
-	
-);
+sub _defaults { ( default_queue_size => 32 ) }
 
-our $VERSION = '0.01';
+sub _channel_open_confirmation_handler {
+    my ($self, $channel) = @_;
+    my $packet = $channel->request_start("subsystem", 1);
+    $packet->put_str("sftp");
+    $packet->send;
+}
 
+sub _channel_failure_handler {
+    my ($self, $channel, $packet) = @_;
+    $self->{error} = 1;
+    $channel->{ssh}->break_client_loop;
+}
 
-# Preloaded methods go here.
+sub _channel_success_handler {
+    my ($self, $channel, $packet) = @_;
+    $channel->{ssh}->break_client_loop;
+}
+
+sub _init_transport {
+    my ($self, $sftp, $opts) = @_;
+    my $ssh = delete $opts->{ssh_perl};
+    if (defined $ssh) {
+
+    }
+    else {
+        my $host = delete $opts->{host};
+        my $user = delete $opts->{user};
+        my $password = delete $opts->{password};
+        eval {
+            $ssh = Net::SSH::Perl->new($host);
+            $ssh->login($user, $password, 'supress_shell');
+        }
+    }
+    $self->{ssh} = $ssh;
+    my $bin = \$sftp->{_bin};
+    my $channel = $self->{channel} = $ssh->_session_channel;
+
+    $channel->open;
+    $channel->register_handler( 91, # SSH2_MSG_CHANNEL_OPEN_CONFIRMATION
+                               sub { $self->_channel_open_confirmation_handler(@_) });
+    $channel->register_handler( 99, # SSH2_MSG_CHANNEL_SUCCESS
+                               sub { $self->_channel_success_handler(@_) });
+    $channel->register_handler(100, # SSH2_MSG_CHANNEL_FAILURE
+                               sub { $self->_channel_failure_handler(@_) });
+
+    $channel->register_handler(_output_buffer => sub {
+                                   my ($channel, $buffer) = @_;
+                                   $$bin .= $buffer->bytes;
+                                   $channel->{ssh}->break_client_loop;
+                               });
+    $ssh->client_loop;
+}
+
+sub _sysreadn {
+    my ($self, $sftp, $n) = @_;
+    my $bin = \$sftp->{_bin};
+    while (length $$bin < $n) {
+        $self->{ssh}->client_loop;
+        # FIXME: handle errors;
+    }
+    $n;
+}
+
+sub _do_io {
+    my ($self, $sftp, $timeout) = @_;
+    my $channel = $self->{channel};
+
+    my $bin = \$sftp->{_bin};
+    my $bout = \$sftp->{_bout};
+
+    while (length $bout) {
+        my $buf = substr($$bout, 0, 20480, '');
+        my $channel->send_data($$bout);
+    }
+
+    defined $timeout and $timeout <= 0 and return;
+
+    $self->_sysreadn($sftp, 4) or return undef;
+    my $len = 4 + unpack N => $$bin;
+    if ($len > 256 * 1024) {
+	$sftp->_set_status(SSH2_FX_BAD_MESSAGE);
+	$sftp->_set_error(SFTP_ERR_REMOTE_BAD_MESSAGE,
+			  "bad remote message received");
+	return undef;
+    }
+    $self->_sysreadn($sftp, $len);
+}
+
+sub after_init {}
 
 1;
 __END__
-# Below is stub documentation for your module. You'd better edit it!
 
 =head1 NAME
 
-Net::SFTP::Foreign::Backend::Net_SSH_Perl - Perl extension for blah blah blah
+Net::SFTP::Foreign::Backend::Net_SSH_Perl - Net::SSSH::Perl backend for Net::SFTP::Foreign
 
 =head1 SYNOPSIS
 
-  use Net::SFTP::Foreign::Backend::Net_SSH_Perl;
-  blah blah blah
+  $sftp = Net::SFTP::Foreign->new($host, backend => 'Net_SSH_Perl');
 
 =head1 DESCRIPTION
 
